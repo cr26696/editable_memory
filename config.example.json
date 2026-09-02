@@ -1,6 +1,7 @@
 {
   "base": "http://localhost:41184",
   "token": "",
+  "hostId": "",
   "nb": "",
   "layers": { "fact": "", "belief": "", "exp": "", "summary": "" },
   "weights": { "fact": 1.0, "summary": 0.9, "exp": 0.7, "belief": 0.6 },

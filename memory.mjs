@@ -20,6 +20,7 @@ const WEIGHTS = { fact: 1.0, summary: 0.9, exp: 0.7, belief: 0.6 };
 const DEFAULTS = {
   base: 'http://localhost:41184',
   token: '',
+  hostId: '', // 为空时自动使用 os.hostname()
   nb: '',
   layers: { fact: '', belief: '', exp: '', summary: '' },
   weights: WEIGHTS,
@@ -45,7 +46,42 @@ function loadState() {
 }
 function saveState(s) { fs.writeFileSync(STATE_PATH, JSON.stringify(s, null, 2) + '\n'); }
 
-// token: env > config 显式 > settings.json 自动解析
+// ---------------- 作用域与主机标识 ----------------
+function resolveHostId(cfg) {
+  return process.env.MEMORY_HOST_ID || cfg.hostId || os.hostname() || 'localhost';
+}
+
+/**
+ * 解析笔记正文中的 scope 元数据
+ * 格式支持: <!-- scope: host:xxx --> 或 <!-- scope: global --> 或 <!-- scope: xxx -->
+ * 未标注时: fact 默认为当前环境 host，其余层级默认为 global
+ */
+function parseScope(body, layer = 'fact') {
+  const m = (body || '').match(/<!--\s*scope:\s*([^\s>]+)\s*-->/i);
+  if (m) {
+    const raw = m[1].trim();
+    return raw.toLowerCase() === 'global' ? 'global' : (raw.startsWith('host:') ? raw : `host:${raw}`);
+  }
+  return layer === 'fact' ? 'host' : 'global';
+}
+
+function normalizeScope(scope, currentHost) {
+  if (!scope || scope === 'global') return 'global';
+  if (scope === 'host' || scope === currentHost) return `host:${currentHost}`;
+  return scope.startsWith('host:') ? scope : `host:${scope}`;
+}
+
+function setScope(body, scope) {
+  const cleanBody = (body || '').replace(/<!--\s*scope:\s*([^\s>]+)\s*-->\n?/i, '').trim();
+  const comment = `<!-- scope: ${scope} -->`;
+  return cleanBody ? `${comment}\n${cleanBody}` : comment;
+}
+
+// 检查该 note 是否在当前机器可见 (global 或 host:<currentHost>)
+function isScopeVisible(noteScope, currentHost) {
+  if (noteScope === 'global') return true;
+  return noteScope === `host:${currentHost}`;
+}
 function resolveToken(cfg) {
   if (process.env.JOPLIN_TOKEN) return process.env.JOPLIN_TOKEN;
   if (cfg.token) return cfg.token;
@@ -159,6 +195,9 @@ async function cmdDoctor() {
   cfg.token = resolveToken(cfg);
   checks.push({ name: 'token', ok: !!cfg.token, detail: cfg.token ? 'resolved' : 'NOT FOUND' });
 
+  const hostId = resolveHostId(cfg);
+  checks.push({ name: 'host-id', ok: true, detail: hostId });
+
   if (cfg.token) {
     try {
       const folders = await joplin(cfg, '/folders?fields=id,title,parent_id');
@@ -199,11 +238,19 @@ async function cmdRecall(argv) {
   if (!q) throw new Error('usage: recall <关键词...>');
   const th = cfg.thresholds;
   const { maxNotes, maxTokens } = cfg.budget;
+  const currentHost = resolveHostId(cfg);
 
-  // 主路径：直接拉四层全部条目 + embedding 门控（不依赖 FTS search，避免英文词搜不到）
-  const all = await allLayerNotes(cfg);
+  // 主路径：拉取四层全部条目
+  const rawAll = await allLayerNotes(cfg);
+  // 1. 作用域过滤：解析 scope 并仅保留 global 或当前 host 绑定的条目
+  const all = rawAll.map(n => {
+    const s = parseScope(n.body, n.layer);
+    const resolvedScope = s === 'host' ? `host:${currentHost}` : s;
+    return { ...n, scope: resolvedScope };
+  }).filter(n => isScopeVisible(n.scope, currentHost));
+
   if (!all.length) {
-    console.log(JSON.stringify({ results: [], meta: { query: q, hit: false, note: '记忆库为空' } }, null, 2));
+    console.log(JSON.stringify({ results: [], meta: { query: q, hit: false, hostId: currentHost, note: '记忆库为空或无匹配当前主机的条目' } }, null, 2));
     return 0;
   }
 
@@ -238,13 +285,23 @@ async function cmdRecall(argv) {
   // 预算裁剪
   let tok = 0; const out = [];
   for (const n of merged) {
-    const t = estTokens(n.title) + estTokens(n.body || '');
+    const cleanBody = (n.body || '').replace(/<!--\s*scope:\s*[^\s>]+\s*-->\n?/i, '').trim();
+    const t = estTokens(n.title) + estTokens(cleanBody);
     if (out.length && tok + t > maxTokens) break;
-    out.push({ id: n.id, layer: n.layer, title: n.title, body: n.body || '', sim: +n.sim.toFixed(3), relevance: n.sim >= th.same_th ? 'strong' : 'weak', degraded: !!n.degraded });
+    out.push({
+      id: n.id,
+      layer: n.layer,
+      scope: n.scope,
+      title: n.title,
+      body: cleanBody,
+      sim: +n.sim.toFixed(3),
+      relevance: n.sim >= th.same_th ? 'strong' : 'weak',
+      degraded: !!n.degraded,
+    });
     tok += t;
   }
 
-  console.log(JSON.stringify({ results: out, meta: { query: q, hit: out.length > 0, scanned: all.length, budget: { maxNotes, maxTokens }, tokens: tok } }, null, 2));
+  console.log(JSON.stringify({ results: out, meta: { query: q, hit: out.length > 0, hostId: currentHost, scanned: all.length, total: rawAll.length, budget: { maxNotes, maxTokens }, tokens: tok } }, null, 2));
   return 0;
 }
 function titlesSimilar(a, b) { // 粗等价: 去除标点后包含关系
@@ -272,34 +329,68 @@ function setConfidence(body, conf) {
 }
 async function cmdRetain(argv) {
   const cfg = loadConfig();
+  const currentHost = resolveHostId(cfg);
+
+  // 解析可选参数 --scope 与 --conf
+  let scopeArg = null;
+  const scopeIdx = argv.indexOf('--scope');
+  if (scopeIdx !== -1 && argv[scopeIdx + 1]) {
+    scopeArg = argv[scopeIdx + 1];
+    argv.splice(scopeIdx, 2);
+  }
+
+  let explicitConf = null;
+  const confIdx = argv.indexOf('--conf');
+  if (confIdx !== -1 && argv[confIdx + 1]) {
+    explicitConf = parseFloat(argv[confIdx + 1]);
+    if (isNaN(explicitConf) || explicitConf < 0 || explicitConf > 1) {
+      throw new Error(`非法置信度: "${argv[confIdx + 1]}"，需 0~1`);
+    }
+    argv.splice(confIdx, 2);
+  }
+
   const layer = argv[0];
   const title = argv[1];
   const body = argv[2] || '';
   if (!LAYERS.includes(layer)) throw new Error(`非法 layer: "${layer}"，合法值: ${LAYERS.join('/')}`);
-  if (!title) throw new Error('usage: retain <layer> <title> [body] [--conf <0~1>]');
+  if (!title) throw new Error('usage: retain <layer> <title> [body] [--scope <global|host>] [--conf <0~1>]');
   const th = cfg.thresholds;
-  // --conf 显式置信度（仅 belief 有效）
-  const confIdx = argv.indexOf('--conf');
-  const explicitConf = confIdx !== -1 ? parseFloat(argv[confIdx + 1]) : null;
-  if (explicitConf !== null && (isNaN(explicitConf) || explicitConf < 0 || explicitConf > 1)) {
-    throw new Error(`非法置信度: "${argv[confIdx + 1]}"，需 0~1`);
+
+  // 确定 targetScope
+  // fact 默认绑定 host:<currentHost>，其余层级默认 global
+  let targetScope;
+  if (scopeArg) {
+    targetScope = normalizeScope(scopeArg, currentHost);
+  } else {
+    targetScope = layer === 'fact' ? `host:${currentHost}` : 'global';
   }
-  // belief 必须有置信度：显式 > 正文自带 > 默认 0.5；时间用 Joplin 自带时间，不写文本
+
+  // belief 必须有置信度：显式 > 正文自带 > 默认 0.5
   let fullBody = body;
   if (layer === 'belief') {
     const cur = explicitConf !== null ? explicitConf : parseConfidence(body);
     fullBody = setConfidence(body, cur !== null ? cur : 0.5);
   }
+  // 注入 scope 标签
+  fullBody = setScope(fullBody, targetScope);
 
-  // 候选：拉四层全部条目，embedding 判定（不依赖 FTS search，避免英文词搜不到）
-  const cands = await allLayerNotes(cfg);
+  // 候选：拉四层全部条目并解析 scope
+  const rawCands = await allLayerNotes(cfg);
+  const cands = rawCands.map(n => {
+    const s = parseScope(n.body, n.layer);
+    return { ...n, scope: s === 'host' ? `host:${currentHost}` : s };
+  });
 
   // embedding 判定（标题级）
   let decisions = [];
   try {
     const { vec } = await embed(cfg, [title, ...cands.map(n => n.title)]);
     const tv = vec(title);
-    decisions = cands.map(n => ({ note: n, sim: cos(tv, vec(n.title)), cls: classify(cos(tv, vec(n.title)), th) }));
+    decisions = cands.map(n => ({
+      note: n,
+      sim: cos(tv, vec(n.title)),
+      cls: classify(cos(tv, vec(n.title)), th),
+    }));
   } catch (e) {
     // 降级: 词面判定
     decisions = cands.map(n => {
@@ -308,8 +399,11 @@ async function cmdRetain(argv) {
     });
   }
 
-  const same = decisions.find(d => d.cls === 'same');
-  const rels = decisions.filter(d => d.cls === 'rel');
+  // 去重覆盖判定：必须「同 scope」且「达到 same_th 阈值」才覆盖，避免异机配置互相踩踏
+  const same = decisions.find(d => d.cls === 'same' && d.note.scope === targetScope);
+  // 相关建议：同一 scope 或当前可见范围内的相关条目
+  const rels = decisions.filter(d => d.cls === 'rel' && isScopeVisible(d.note.scope, currentHost));
+
   let result;
   if (same) {
     // 合并更新：取更完整正文；若 belief 再次确认（更新），置信度 +0.1 封顶 0.9
@@ -319,8 +413,9 @@ async function cmdRetain(argv) {
       const newConf = explicitConf !== null ? explicitConf : (oldConf !== null ? oldConf + 0.1 : 0.5);
       keep = setConfidence(keep, Math.min(newConf, 0.9));
     }
+    keep = setScope(keep, targetScope);
     await joplin(cfg, `/notes/${same.note.id}`, { method: 'PUT', body: JSON.stringify({ title, body: keep, parent_id: cfg.layers[layer] }) });
-    result = { action: 'updated', id: same.note.id, layer, sameSim: +same.sim.toFixed(3), degraded: !!same.degraded };
+    result = { action: 'updated', id: same.note.id, layer, scope: targetScope, sameSim: +same.sim.toFixed(3), degraded: !!same.degraded };
     if (layer === 'belief') {
       const after = parseConfidence(keep);
       result.confidence = after;
@@ -328,7 +423,7 @@ async function cmdRetain(argv) {
     }
   } else {
     const created = await joplin(cfg, '/notes', { method: 'POST', body: JSON.stringify({ title, body: fullBody, parent_id: cfg.layers[layer] }) });
-    result = { action: 'created', id: created.id, layer, relCount: rels.length, degraded: !!(rels[0] && rels[0].degraded) };
+    result = { action: 'created', id: created.id, layer, scope: targetScope, relCount: rels.length, degraded: !!(rels[0] && rels[0].degraded) };
     if (layer === 'belief') result.confidence = parseConfidence(fullBody);
     if (rels.length >= th.N) {
       result.aggregateHint = `同实体互补条目已达 ${rels.length} 条（>=N=${th.N}），建议运行 reflect 聚合为 summary`;
@@ -353,8 +448,17 @@ async function cmdReflect(argv) {
   }
   // dry-run: 检测
   const th = cfg.thresholds;
+  const currentHost = resolveHostId(cfg);
   const suggestions = [];
-  const all = await allLayerNotes(cfg);
+  const rawAll = await allLayerNotes(cfg);
+  const all = rawAll.map(n => {
+    const s = parseScope(n.body, n.layer);
+    return { ...n, scope: s === 'host' ? `host:${currentHost}` : s };
+  });
+
+  // 1. 跨机共性经验泛化检测（若同类 exp/belief 分布在不同 host，建议泛化为 global）
+  const crossHostGroups = [];
+  const expNotes = all.filter(n => n.layer === 'exp' && n.scope.startsWith('host:'));
   // 同实体聚类（标题 embedding）
   const groups = [];
   const used = new Set();
@@ -375,33 +479,47 @@ async function cmdReflect(argv) {
   }
   for (const g of groups) {
     const layers = [...new Set(g.map(n => n.layer))];
+    const scopes = [...new Set(g.map(n => n.scope))];
     const hasSummary = layers.includes('summary');
     const nonSummary = g.filter(n => n.layer !== 'summary');
     const hasFact = layers.includes('fact');
     const hasBelief = layers.includes('belief');
+
+    // 跨主机相同经验检测
+    if (scopes.length > 1 && layers.every(l => l === 'exp' || l === 'belief')) {
+      suggestions.push({
+        type: 'generalize-scope',
+        reason: `检测到分布于多台设备 (${scopes.join(', ')}) 的同类经验，建议提炼并泛化为 scope: global`,
+        sourceIds: g.map(n => n.id),
+        targetLayer: g[0].layer,
+        targetScope: 'global',
+        materials: g.map(n => ({ id: n.id, layer: n.layer, scope: n.scope, title: n.title, body: n.body })),
+      });
+    }
+
     if (hasFact && hasBelief && !hasSummary) {
       suggestions.push({
         type: 'conflict-review', reason: '同实体 fact/belief 并存，需人工/LLM 判断冲突或互补',
         sourceIds: g.map(n => n.id), targetLayer: null,
-        materials: g.map(n => ({ id: n.id, layer: n.layer, title: n.title, body: n.body })),
+        materials: g.map(n => ({ id: n.id, layer: n.layer, scope: n.scope, title: n.title, body: n.body })),
       });
     } else if (hasSummary && nonSummary.length >= 1) {
       suggestions.push({
         type: 'aggregate-to-summary', reason: `已有 summary + ${nonSummary.length} 条互补条目，建议把新 fact/exp 汇入 summary`, 
         sourceIds: g.map(n => n.id), targetLayer: 'summary',
-        materials: g.map(n => ({ id: n.id, layer: n.layer, title: n.title, body: n.body })),
+        materials: g.map(n => ({ id: n.id, layer: n.layer, scope: n.scope, title: n.title, body: n.body })),
       });
     } else if (g.length >= th.N && !hasSummary) {
       suggestions.push({
         type: 'aggregate', reason: `同实体互补 ${g.length} 条（>=N=${th.N}），建议聚合为 summary`,
         sourceIds: g.map(n => n.id), targetLayer: 'summary',
-        materials: g.map(n => ({ id: n.id, layer: n.layer, title: n.title, body: n.body })),
+        materials: g.map(n => ({ id: n.id, layer: n.layer, scope: n.scope, title: n.title, body: n.body })),
       });
     } else {
       suggestions.push({
         type: 'complement-keep', reason: `同实体互补 ${g.length} 条，未达 N=${th.N}，保持独立`,
         sourceIds: g.map(n => n.id), targetLayer: null,
-        materials: g.map(n => ({ id: n.id, layer: n.layer, title: n.title })),
+        materials: g.map(n => ({ id: n.id, layer: n.layer, scope: n.scope, title: n.title })),
       });
     }
   }
@@ -412,24 +530,29 @@ async function cmdReflect(argv) {
     const upd = n.updated_time || 0;
     const ageDays = upd ? (now - upd) / 86400000 : 0;
     if (conf !== null && conf >= 0.9) {
-      suggestions.push({ type: 'upgrade', reason: `belief 置信度 ${conf}>=0.9，建议升级 fact`, sourceIds: [n.id], targetLayer: 'fact', materials: [{ id: n.id, layer: 'belief', title: n.title, body: n.body }] });
+      suggestions.push({ type: 'upgrade', reason: `belief 置信度 ${conf}>=0.9，建议升级 fact`, sourceIds: [n.id], targetLayer: 'fact', materials: [{ id: n.id, layer: 'belief', scope: n.scope, title: n.title, body: n.body }] });
     } else if (conf !== null && conf < 0.7 && ageDays >= th.decay_days) {
-      suggestions.push({ type: 'decay-review', reason: `belief 置信度 ${conf}<0.7 且 ${Math.round(ageDays)} 天未更新，建议复核/降级/删除`, sourceIds: [n.id], targetLayer: null, materials: [{ id: n.id, layer: 'belief', title: n.title, body: n.body }] });
+      suggestions.push({ type: 'decay-review', reason: `belief 置信度 ${conf}<0.7 且 ${Math.round(ageDays)} 天未更新，建议复核/降级/删除`, sourceIds: [n.id], targetLayer: null, materials: [{ id: n.id, layer: 'belief', scope: n.scope, title: n.title, body: n.body }] });
     }
   }
   console.log(JSON.stringify({ dryRun: true, suggestions }, null, 2));
   return 0;
 }
 async function applyReflect(cfg, spec) {
-  const { action, targetLayer, title, body, sourceIds } = spec;
+  const { action, targetLayer, targetScope, title, body, sourceIds } = spec;
+  const currentHost = resolveHostId(cfg);
+  let finalBody = body || '';
+  if (targetScope) {
+    finalBody = setScope(finalBody, normalizeScope(targetScope, currentHost));
+  }
   if (action === 'aggregate') {
     if (!targetLayer || !LAYERS.includes(targetLayer)) throw new Error('aggregate 需要 targetLayer ∈ fact/belief/exp/summary');
-    const created = await joplin(cfg, '/notes', { method: 'POST', body: JSON.stringify({ title, body, parent_id: cfg.layers[targetLayer] }) });
+    const created = await joplin(cfg, '/notes', { method: 'POST', body: JSON.stringify({ title, body: finalBody, parent_id: cfg.layers[targetLayer] }) });
     for (const id of sourceIds) await joplin(cfg, `/notes/${id}`, { method: 'DELETE' });
     console.log(JSON.stringify({ applied: 'aggregate', created: created.id, deleted: sourceIds }, null, 2));
   } else if (action === 'migrate') {
     const [id] = sourceIds;
-    await joplin(cfg, `/notes/${id}`, { method: 'PUT', body: JSON.stringify({ title, body, parent_id: cfg.layers[targetLayer] }) });
+    await joplin(cfg, `/notes/${id}`, { method: 'PUT', body: JSON.stringify({ title, body: finalBody, parent_id: cfg.layers[targetLayer] }) });
     console.log(JSON.stringify({ applied: 'migrate', id, targetLayer }, null, 2));
   } else {
     throw new Error(`未知 action: ${action}（支持 aggregate/migrate）`);
@@ -455,6 +578,16 @@ async function cmdTest() {
   catch (e) { ok('retain-invalid-layer', /非法 layer/.test(e.message), e.message); }
   // 4. 判定函数
   ok('classify', classify(0.8, cfg.thresholds) === 'same' && classify(0.5, cfg.thresholds) === 'rel' && classify(0.1, cfg.thresholds) === 'none');
+  // 5. Scope 解析与过滤逻辑测试
+  const s1 = parseScope('<!-- scope: global -->\n正文', 'fact');
+  const s2 = parseScope('<!-- scope: host:pc-1 -->\n正文', 'fact');
+  const s3 = parseScope('无标签正文', 'fact');
+  const s4 = parseScope('无标签正文', 'exp');
+  ok('scope-parse', s1 === 'global' && s2 === 'host:pc-1' && s3 === 'host' && s4 === 'global', `s1=${s1}, s2=${s2}, s3=${s3}, s4=${s4}`);
+  ok('scope-visibility', isScopeVisible('global', 'pc-1') === true && isScopeVisible('host:pc-1', 'pc-1') === true && isScopeVisible('host:pc-2', 'pc-1') === false);
+  const taggedBody = setScope('原正文内容', 'host:test-node');
+  ok('scope-set', taggedBody.includes('<!-- scope: host:test-node -->') && taggedBody.includes('原正文内容'));
+
   const allPass = results.every(r => r.pass);
   console.log(JSON.stringify({ test: 'memory', pass: allPass, results }, null, 2));
   return allPass ? 0 : 1;
@@ -464,10 +597,10 @@ async function cmdTest() {
 const USAGE = `memory — AI 长期记忆 CLI
 
 用法:
-  memory doctor                    诊断: 连通性/token/层id/embedding
-  memory recall <关键词...>         门控召回记忆条目 → JSON
-  memory retain <layer> <title> [body] [--conf <0~1>]  写入(去重/更新) → JSON
-  memory reflect                   检测冲突/聚合/升级建议(dry-run) → JSON
+  memory doctor                    诊断: 连通性/token/层id/embedding/host-id
+  memory recall <关键词...>         门控召回记忆条目(按 scope 过滤) → JSON
+  memory retain <layer> <title> [body] [--scope <global|host>] [--conf <0~1>]  写入(去重/更新) → JSON
+  memory reflect                   检测冲突/聚合/升级/跨机泛化建议(dry-run) → JSON
   memory reflect --apply '<json>'  执行聚合/迁移
   memory test                      隔离环境测试例
   memory --help                    本帮助

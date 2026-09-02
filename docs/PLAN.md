@@ -83,9 +83,9 @@ config.json：`base`(默认 localhost:41184) + token(自动解析 settings.json)
   4. 中文关键词正确 URL 编码（`服务器` → `%E6%9C%8D%E5%8A%A1%E5%99%A8`）
 
 ### Step 4 — recall（复杂·易错）
-- 流程：search → 过滤四层 → 层权重排序 → embedding 门控(标题相似度) → 去重合并 → 预算裁剪 → 输出 JSON
+- 流程：search → 过滤四层 → 作用域过滤（保留 Global + 当前 Host） → 层权重排序 → embedding 门控(标题相似度) → 去重合并 → 预算裁剪 → 输出 JSON
 - **验收指标**：
-  1. 关键词「服务器」召回只含 `parent_id∈四层` 的记忆条目，**不含**用户笔记（如「Redox 调研」）
+  1. 关键词「服务器」召回只含 `parent_id∈四层` 且属于当前 host 或 global 的记忆条目，**不含**用户笔记与异机配置
   2. 输出条数 ≤5、token ≤800
   3. 层权重序正确：fact 排在 exp/belief 前
   4. 空结果输出 `{results:[],meta}` 而非报错
@@ -94,12 +94,13 @@ config.json：`base`(默认 localhost:41184) + token(自动解析 settings.json)
 
 ### Step 5 — retain（写入记忆）—— ✅ 已讨论定稿
 
-**接口**：`memory.mjs retain <layer> <title> <body>`
+**接口**：`memory.mjs retain <layer> <title> <body> [--scope <host|global>]`
 
 **layer 归属**：由 **LLM 判断**（语义理解比机械规则透彻），SKILL.md 提供**固定速查表**作依据（触发词/特征 → fact/belief/exp/summary），保证可复现、非随性发挥。
 
-**去重判定（标题级为主）**：
+**去重判定（标题级为主 + 作用域限定）**：
 - 相似度算在**标题 embedding** 上（标题=一句话结论+核心关键词，语义已浓缩）
+- 仅在**同一 scope 命名空间**下比对（避免异机同名配置误覆盖）
 - **灰色区**（相似度落带）才回退正文级精判
 
 **判定树**（程序化，唯一触发点）：
