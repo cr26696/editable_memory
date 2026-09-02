@@ -65,5 +65,9 @@ node memory.mjs test
 - `memory.mjs`: CLI 核心脚本（零第三方依赖，Node.js >= 18）
 - `SKILL.md`: 供 Agent 读取的 Skill 规范与使用指引
 - `DESIGN.md`: 系统设计理念、架构权衡与运行机制详解
+- `docs/`: 演进过程中的设计初稿、实施计划与实测调研文档
+  - `docs/PLAN.md`: CLI 改造与分步实施路线
+  - `docs/ai-memory-sync-design.md`: 早期多端同步与架构权衡草案
+  - `docs/notes/embedding-api.md`: 向量模型分辨力与选型实测记录
 - `config.example.json`: 配置模版（生产配置 `config.json` 与本地向量缓存 `state.json` 默认被 `.gitignore` 忽略）
 - `LICENSE`: MIT License
