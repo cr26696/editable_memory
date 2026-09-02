@@ -1,49 +1,68 @@
-# editable_memory — AI 长期记忆（程序化 CLI）
+# editable_memory — AI 长期记忆 CLI
 
-Agent 的「蒸馏知识层」，持久化到 Joplin 笔记本 `AI-Memory`（四层：fact / belief / exp / summary）。
-**按需召回，永不整库注入；提炼写入，绝不堆积日志。**
-判定（去重 / 门控 / 排序）全走 embedding 余弦，零依赖 Node CLI（Node >= 18）。
+轻量且结构化的 AI 长期记忆机制。将经验、事实与偏好持久化至本地 Joplin，通过零依赖 Node CLI（`memory.mjs`）实现精准按需召回与提炼写入。
 
-## 安装
+---
+
+## 核心设计理念
+
+1. **按需召回，杜绝上下文污染**
+   不搞“全量注入提示词”。任务前仅按关键词召回最相关的极少数条目（严格限制 ≤5 条 / ≤800 Token）。
+2. **算法负责数学判定，模型负责语义提炼**
+   条目重复度、相关度、预算裁剪由脚本基于向量余弦相似度计算（确定性高、执行快）；模型仅负责总结经验结论和分层。
+3. **四层结构化分类**
+   按知识属性拆分为四层，分属不同 Joplin 笔记本并赋予不同检索权重：
+   - **fact** (权重 1.0): 确定、长期有效的客观环境/系统事实。
+   - **summary** (权重 0.9): 针对特定项目/实体的宏观画像与全貌。
+   - **exp** (权重 0.7): 一次性排错排坑经验、踩坑记录。
+   - **belief** (权重 0.6): 带置信度的推断、偏好假设（随复现验证逐步升降级）。
+
+---
+
+## 快速上手
+
+### 1. 安装配置
+
+将本项目放入 Agent 的 skills 目录：
 
 ```bash
-# 1. 复制到 skill 目录（例如 pi 的 skills 下）
-cp -r . ~/.pi/agent/skills/memory/
-
-# 2. 准备本地配置（真实密钥不进仓库）
+# 复制模板配置
 cp config.example.json config.json
-#    在 config.json 里填 Joplin token / notebook id / embedding apiKey
-#    或用环境变量注入：JOPLIN_TOKEN、EMBED_API_KEY
 ```
 
-> 首次运行 `node memory.mjs doctor` 会自动发现并缓存 Joplin 层 id、解析 token。
+编辑 `config.json` 填入本地 Joplin Web Clipper Token 及 Embedding API Key（也支持通过环境变量 `JOPLIN_TOKEN` 与 `EMBED_API_KEY` 传入）。
 
-## 用法
+运行诊断确认环境正常：
+```bash
+node memory.mjs doctor
+```
+> `doctor` 会自动在 Joplin 中寻找或创建 `AI-Memory` 笔记本及四层子笔记本，并自动把映射 ID 写入 `config.json`。
+
+### 2. 核心指令
 
 ```bash
-node memory.mjs recall <关键词...>   # 门控召回 → JSON（任务开始前）
-node memory.mjs retain <layer> <title> [body]  # 去重写入 → JSON（任务结束后）
-node memory.mjs reflect              # 检测冲突/聚合/升级建议 → JSON
-node memory.mjs reflect --apply '<json>'  # 执行聚合/迁移（两段式第二步）
-node memory.mjs doctor               # 诊断：连通性/token/层id/embedding
-node memory.mjs test                 # 自检
+# 任务前：按关键词召回（返回匹配 JSON）
+node memory.mjs recall "关键词"
+
+# 任务后：提炼沉淀（自动去重/判定重复）
+node memory.mjs retain fact "CentOS 8 缺失 musl 静态链接库" "详情..."
+node memory.mjs retain belief "用户倾向使用精简纯 CLI 工具" "详情..." --conf 0.8
+
+# 周期维护：发现碎片聚合、置信度升级
+node memory.mjs reflect
+
+# 诊断与单测
+node memory.mjs doctor
+node memory.mjs test
 ```
 
-完整使用说明见 [SKILL.md](./SKILL.md)。
+详细参数交互说明与调用契约见 [SKILL.md](./SKILL.md)。
 
-## 项目结构
+---
 
-- `memory.mjs` — 程序化 CLI（recall/retain/reflect/doctor/test）
-- `SKILL.md` — skill 文档（工作流 + layer 判定速查表）
-- `config.example.json` — 配置模板（不含密钥）
-- `LICENSE` — MIT
+## 目录说明
 
-## 不提交的文件
-
-- `config.json` — 本地配置，含 Joplin token / embedding API key（模板见 `config.example.json`）
-- `state.json` — 本地 embedding 向量缓存
-
-## 阈值（config.json 可调）
-
-`same_th=0.75`（相同→合并）、`rel_th=0.30`（相关→门控/保持）、`N=3`（互补聚合触发）、`M=20`（周期 reflect 触发）。
-初值来自小样本实测，随使用积累校准。
+- `memory.mjs`: CLI 核心脚本（零第三方依赖，Node.js >= 18）
+- `SKILL.md`: 供 Agent 读取的 Skill 规范与使用指引
+- `config.example.json`: 配置模版（生产配置 `config.json` 与本地向量缓存 `state.json` 默认被 `.gitignore` 忽略）
+- `LICENSE`: MIT License
