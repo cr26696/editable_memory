@@ -1,0 +1,8 @@
+# 本地配置（含 Joplin token / embedding API key），用 config.example.json 做模板
+config.json
+
+# 本地向量缓存（title -> embedding）
+state.json
+
+node_modules/
+*.log

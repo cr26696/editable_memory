@@ -1,0 +1,15 @@
+{
+  "base": "http://localhost:41184",
+  "token": "",
+  "nb": "",
+  "layers": { "fact": "", "belief": "", "exp": "", "summary": "" },
+  "weights": { "fact": 1.0, "summary": 0.9, "exp": 0.7, "belief": 0.6 },
+  "budget": { "maxNotes": 5, "maxTokens": 800 },
+  "thresholds": { "same_th": 0.75, "rel_th": 0.3, "N": 3, "M": 20, "decay_days": 60 },
+  "embed": {
+    "model": "text-embedding-3-large",
+    "apiBase": "https://api.chatanywhere.tech/v1",
+    "apiKey": "",
+    "dims": 3072
+  }
+}
